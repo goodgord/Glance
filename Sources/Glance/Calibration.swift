@@ -10,11 +10,14 @@ final class CalibrationController {
 
     private enum Phase { case intro, settle, collect }
 
+    /// 3×3 grid reaching close to the edges (the ambiguous zones between stacked monitors),
+    /// visited in a snake so the eyes never jump far within a screen.
     private static let points: [CGPoint] = [
-        CGPoint(x: 0.5, y: 0.5), CGPoint(x: 0.2, y: 0.75), CGPoint(x: 0.8, y: 0.75),
-        CGPoint(x: 0.8, y: 0.25), CGPoint(x: 0.2, y: 0.25),
+        CGPoint(x: 0.08, y: 0.92), CGPoint(x: 0.5, y: 0.92), CGPoint(x: 0.92, y: 0.92),
+        CGPoint(x: 0.92, y: 0.5), CGPoint(x: 0.5, y: 0.5), CGPoint(x: 0.08, y: 0.5),
+        CGPoint(x: 0.08, y: 0.08), CGPoint(x: 0.5, y: 0.08), CGPoint(x: 0.92, y: 0.08),
     ]
-    private let introTime = 3.0, settleTime = 0.9, collectTime = 1.2
+    private let introTime = 3.0, settleTime = 0.8, collectTime = 1.0
 
     private let onFinish: (CalibrationData?) -> Void
     private var targets: [Target] = []
@@ -26,6 +29,7 @@ final class CalibrationController {
     private var keyMonitor: Any?
     private var samples: [[Double]] = []
     private var labels: [String] = []
+    private var groups: [Int] = []
 
     init(onFinish: @escaping (CalibrationData?) -> Void) {
         self.onFinish = onFinish
@@ -68,6 +72,7 @@ final class CalibrationController {
         guard phase == .collect, let sample, index < targets.count else { return }
         samples.append(sample.features)
         labels.append(targets[index].key)
+        groups.append(index)
     }
 
     private func tick() {
@@ -127,8 +132,8 @@ final class CalibrationController {
 
         // Need a decent number of samples on every display for the result to be useful.
         let perScreen = Dictionary(grouping: labels, by: { $0 }).mapValues(\.count)
-        let complete = !cancelled && Set(targets.map(\.key)).allSatisfy { (perScreen[$0] ?? 0) >= 8 }
-        onFinish(complete ? CalibrationData(samples: samples, labels: labels, date: Date()) : nil)
+        let complete = !cancelled && Set(targets.map(\.key)).allSatisfy { (perScreen[$0] ?? 0) >= 20 }
+        onFinish(complete ? CalibrationData(samples: samples, labels: labels, groups: groups, date: Date()) : nil)
     }
 }
 

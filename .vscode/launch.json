@@ -1,0 +1,24 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Glance}",
+            "name": "Debug Glance",
+            "target": "Glance",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug Glance"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:Glance}",
+            "name": "Release Glance",
+            "target": "Glance",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release Glance"
+        }
+    ]
+}

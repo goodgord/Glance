@@ -11,7 +11,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var typingGrace: Double { [.snappy: 0.5, .balanced: 0.9, .relaxed: 1.5][self]! }
     }
 
+    /// When focus moves: on the first keystroke after a pause (keys are held for a moment while it
+    /// switches), or as soon as your gaze settles on another screen.
+    private enum SwitchMode: String, CaseIterable {
+        case onTyping = "When I Start Typing", onLook = "As Soon As I Look"
+    }
+
     private let tracker = GazeTracker()
+    private let keyboard = KeyboardInterceptor()
     private var statusItem: NSStatusItem!
     private var calibration: CalibrationController?
     private var classifier: GazeClassifier?
@@ -21,6 +28,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var smoothed: [Double]?
     private var faceVisible = false
     private var lookingAt: (label: String, confidence: Double)?
+    private var gazeHistory: [(time: CFAbsoluteTime, label: String?, confidence: Double)] = []
+    private var accuracy: (overall: Double, perLabel: [String: Double])?
     private var candidate: CGDirectDisplayID?
     private var candidateSince: CFAbsoluteTime = 0
     private var lastSwitch: CFAbsoluteTime = 0
@@ -31,6 +40,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let enabledItem = NSMenuItem(title: "Enabled", action: #selector(toggleEnabled), keyEquivalent: "e")
     private let warpItem = NSMenuItem(title: "Move Pointer Too", action: #selector(toggleWarp), keyEquivalent: "")
     private let loginItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
+    private let accuracyLine = NSMenuItem(title: "", action: nil, keyEquivalent: "")
     private let accessibilityItem = NSMenuItem(title: "Grant Accessibility Access…", action: #selector(openAccessibility), keyEquivalent: "")
 
     // Settings
@@ -46,6 +56,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var responsiveness: Responsiveness {
         get { Responsiveness(rawValue: defaults.string(forKey: "responsiveness") ?? "") ?? .balanced }
         set { defaults.set(newValue.rawValue, forKey: "responsiveness") }
+    }
+    private var switchMode: SwitchMode {
+        get { SwitchMode(rawValue: defaults.string(forKey: "switchMode") ?? "") ?? .onTyping }
+        set { defaults.set(newValue.rawValue, forKey: "switchMode") }
     }
     private var cameraID: String? {
         get { defaults.string(forKey: "cameraID") }
@@ -63,8 +77,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.imagePosition = .imageLeading
         buildMenu()
 
-        if let data = CalibrationData.load() { classifier = GazeClassifier(data) }
+        if let data = CalibrationData.load() { loadClassifier(data) }
         if !FocusSwitcher.isTrusted { FocusSwitcher.promptForAccessibility() }
+
+        keyboard.shouldHold = { [weak self] in self?.typingTarget() != nil }
+        keyboard.redirect = { [weak self] in self?.redirectForTyping() ?? false }
 
         tracker.onSample = { [weak self] in self?.handle($0) }
 
@@ -82,9 +99,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if enabled { startTracking() }
+        updateKeyboardInterceptor()
         refreshUI()
 
-        if classifier == nil || !calibrationMatchesDisplays() {
+        // Old 5-point calibrations can't be scored and miss the screen edges, so redo them.
+        if classifier == nil || !calibrationMatchesDisplays() || CalibrationData.load()?.groups == nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.calibrate() }
         }
     }
@@ -106,10 +125,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let wasVisible = faceVisible
         faceVisible = sample != nil
+        let now = CFAbsoluteTimeGetCurrent()
+        gazeHistory.removeAll { now - $0.time > 2 }
         guard let sample else {
             smoothed = nil
             candidate = nil
             lookingAt = nil
+            gazeHistory.append((now, nil, 0))
             if wasVisible { refreshUI() }
             return
         }
@@ -124,26 +146,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let classifier, let result = classifier.classify(smoothed!),
               let target = displays[result.label] else {
             lookingAt = nil
+            gazeHistory.append((now, nil, 0))
             refreshUI()
             return
         }
+        gazeHistory.append((now, result.label, result.confidence))
         let previousKey = lookingAt?.label
         lookingAt = result
         if previousKey != result.label || !wasVisible { refreshUI() } else { updateStatusLine() }
 
-        guard enabled, result.confidence >= minConfidence else { candidate = nil; return }
+        guard enabled, switchMode == .onLook, result.confidence >= minConfidence else { candidate = nil; return }
 
-        let now = CFAbsoluteTimeGetCurrent()
+        let r = responsiveness
+
+        // Typing indicates that focus should stay put. Reset any pending gaze
+        // dwell on every recent keypress, then require a fresh dwell period.
+        guard CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown) >= r.typingGrace else {
+            candidate = nil
+            return
+        }
+
         if candidate != target.id {
             candidate = target.id
             candidateSince = now
             return
         }
 
-        let r = responsiveness
         guard now - candidateSince >= r.dwell,
               now - lastSwitch >= switchCooldown,
-              CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown) >= r.typingGrace,
               CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .leftMouseDown) >= clickGrace,
               CGEventSource.buttonState(.combinedSessionState, button: .left) == false,
               FocusSwitcher.isTrusted,
@@ -151,6 +181,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         FocusSwitcher.focus(display: target.id, warpPointer: warpPointer)
         lastSwitch = now
+    }
+
+    // MARK: - Typing-triggered switching
+
+    /// The display you've steadily been looking at for the dwell window, if it differs from where
+    /// focus is. Cheap (no Accessibility calls) since it runs inside the keyboard event tap.
+    private func steadyGaze() -> CGDirectDisplayID? {
+        let now = CFAbsoluteTimeGetCurrent()
+        let window = max(responsiveness.dwell, 0.3)
+        let recent = gazeHistory.filter { now - $0.time <= window }
+        guard recent.count >= 3, let last = recent.last, now - last.time < 0.3 else { return nil }
+
+        let votes = Dictionary(grouping: recent.compactMap(\.label), by: { $0 })
+        guard let (label, hits) = votes.max(by: { $0.value.count < $1.value.count }),
+              Double(hits.count) / Double(recent.count) >= 0.8 else { return nil }
+        let meanConfidence = recent.filter { $0.label == label }.map(\.confidence).reduce(0, +) / Double(hits.count)
+        guard meanConfidence >= minConfidence else { return nil }
+        return displays[label]?.id
+    }
+
+    private func typingTarget() -> CGDirectDisplayID? {
+        guard enabled, switchMode == .onTyping, calibration == nil, FocusSwitcher.isTrusted,
+              CGEventSource.buttonState(.combinedSessionState, button: .left) == false,
+              CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .leftMouseDown) >= clickGrace
+        else { return nil }
+        return steadyGaze()
+    }
+
+    private func redirectForTyping() -> Bool {
+        guard let target = typingTarget(), FocusSwitcher.focusedDisplay() != target else { return false }
+        let moved = FocusSwitcher.focus(display: target, warpPointer: warpPointer)
+        if moved { lastSwitch = CFAbsoluteTimeGetCurrent() }
+        return moved
+    }
+
+    private func updateKeyboardInterceptor() {
+        keyboard.burstGap = responsiveness.typingGrace
+        if enabled && switchMode == .onTyping && FocusSwitcher.isTrusted {
+            keyboard.start()
+        } else {
+            keyboard.stop()
+        }
+    }
+
+    private func loadClassifier(_ data: CalibrationData) {
+        classifier = GazeClassifier(data)
+        accuracy = GazeClassifier.crossValidate(data)
     }
 
     private func calibrationMatchesDisplays() -> Bool {
@@ -167,6 +244,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         statusLine.isEnabled = false
         menu.addItem(statusLine)
+        accuracyLine.isEnabled = false
+        menu.addItem(accuracyLine)
         menu.addItem(.separator())
 
         enabledItem.target = self
@@ -184,6 +263,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let respItem = NSMenuItem(title: "Responsiveness", action: nil, keyEquivalent: "")
         respItem.submenu = respMenu
         menu.addItem(respItem)
+
+        let modeMenu = NSMenu()
+        for m in SwitchMode.allCases {
+            let item = NSMenuItem(title: m.rawValue, action: #selector(setSwitchMode(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = m.rawValue
+            modeMenu.addItem(item)
+        }
+        let modeItem = NSMenuItem(title: "Switch Focus", action: nil, keyEquivalent: "")
+        modeItem.submenu = modeMenu
+        menu.addItem(modeItem)
 
         let camItem = NSMenuItem(title: "Camera", action: nil, keyEquivalent: "")
         camItem.submenu = NSMenu()
@@ -219,6 +309,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.item(withTitle: "Responsiveness")?.submenu?.items.forEach {
             $0.state = ($0.representedObject as? String) == responsiveness.rawValue ? .on : .off
         }
+        menu.item(withTitle: "Switch Focus")?.submenu?.items.forEach {
+            $0.state = ($0.representedObject as? String) == switchMode.rawValue ? .on : .off
+        }
+        // Accessibility may have been granted since launch.
+        if enabled && switchMode == .onTyping && !keyboard.isRunning { updateKeyboardInterceptor() }
         refreshUI()
     }
 
@@ -227,6 +322,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         warpItem.state = warpPointer ? .on : .off
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         accessibilityItem.isHidden = FocusSwitcher.isTrusted
+
+        if let accuracy {
+            let parts = accuracy.perLabel
+                .compactMap { key, acc in screenNumber(for: key).map { ($0, acc) } }
+                .sorted { $0.0 < $1.0 }
+                .map { "\($0.0): \(Int($0.1 * 100))%" }
+            accuracyLine.title = "Calibration accuracy \(Int(accuracy.overall * 100))%  (\(parts.joined(separator: ", ")))"
+            accuracyLine.isHidden = false
+        } else {
+            accuracyLine.isHidden = true
+        }
 
         let symbol: String
         if !enabled { symbol = "eye.slash" }
@@ -267,6 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleEnabled() {
         enabled.toggle()
         if enabled { startTracking() } else if calibration == nil { tracker.stop() }
+        updateKeyboardInterceptor()
         lookingAt = nil
         faceVisible = false
         refreshUI()
@@ -294,6 +401,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let raw = sender.representedObject as? String, let r = Responsiveness(rawValue: raw) {
             responsiveness = r
         }
+        updateKeyboardInterceptor()
+    }
+
+    @objc private func setSwitchMode(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let m = SwitchMode(rawValue: raw) {
+            switchMode = m
+        }
+        candidate = nil
+        updateKeyboardInterceptor()
     }
 
     @objc private func selectCamera(_ sender: NSMenuItem) {
@@ -315,9 +431,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let controller = CalibrationController { [weak self] data in
             guard let self else { return }
             self.calibration = nil
-            if let data, let clf = GazeClassifier(data) {
+            if let data, GazeClassifier(data) != nil {
                 data.save()
-                self.classifier = clf
+                self.loadClassifier(data)
             } else if data != nil || self.classifier == nil {
                 self.showAlert("Calibration didn't collect enough data",
                                "Make sure your face is visible to the camera and try again.")
