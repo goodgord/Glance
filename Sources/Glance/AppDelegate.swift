@@ -14,7 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// When focus moves: on the first keystroke after a pause (keys are held for a moment while it
     /// switches), or as soon as your gaze settles on another screen.
     private enum SwitchMode: String, CaseIterable {
-        case onTyping = "When I Start Typing", onLook = "As Soon As I Look"
+        case onTyping = "When I Start Typing", onLook = "As Soon As I Look", onWink = "When I Wink 😉"
     }
 
     private let tracker = GazeTracker()
@@ -30,6 +30,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lookingAt: (label: String, confidence: Double)?
     private var gazeHistory: [(time: CFAbsoluteTime, label: String?, confidence: Double)] = []
     private var accuracy: (overall: Double, perLabel: [String: Double])?
+    private var wink = WinkDetector()
+    private var flash: (text: String, until: CFAbsoluteTime)?
     private var candidate: CGDirectDisplayID?
     private var candidateSince: CFAbsoluteTime = 0
     private var lastSwitch: CFAbsoluteTime = 0
@@ -99,7 +101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         if enabled { startTracking() }
-        updateKeyboardInterceptor()
+        applySwitchMode()
         refreshUI()
 
         // Old 5-point calibrations can't be scored and miss the screen edges, so redo them.
@@ -132,8 +134,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             candidate = nil
             lookingAt = nil
             gazeHistory.append((now, nil, 0))
+            wink.reset()
             if wasVisible { refreshUI() }
             return
+        }
+
+        if let winkStart = wink.update(left: sample.leftOpenness, right: sample.rightOpenness, at: now),
+           enabled, switchMode == .onWink {
+            handleWink(startedAt: winkStart)
         }
 
         // Light exponential smoothing to calm Vision's jitter.
@@ -150,7 +158,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             refreshUI()
             return
         }
-        gazeHistory.append((now, result.label, result.confidence))
+        // Narrowed eyes (blinks, winks) skew the eye features, so leave those frames out.
+        if !wink.eyesNarrowed { gazeHistory.append((now, result.label, result.confidence)) }
         let previousKey = lookingAt?.label
         lookingAt = result
         if previousKey != result.label || !wasVisible { refreshUI() } else { updateStatusLine() }
@@ -187,17 +196,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// The display you've steadily been looking at for the dwell window, if it differs from where
     /// focus is. Cheap (no Accessibility calls) since it runs inside the keyboard event tap.
-    private func steadyGaze() -> CGDirectDisplayID? {
-        let now = CFAbsoluteTimeGetCurrent()
-        let window = max(responsiveness.dwell, 0.3)
-        let recent = gazeHistory.filter { now - $0.time <= window }
-        guard recent.count >= 3, let last = recent.last, now - last.time < 0.3 else { return nil }
+    private func steadyGaze(until end: CFAbsoluteTime = CFAbsoluteTimeGetCurrent(), window: Double? = nil,
+                            minShare: Double = 0.8, minConfidence: Double? = nil) -> CGDirectDisplayID? {
+        let window = window ?? max(responsiveness.dwell, 0.3)
+        let recent = gazeHistory.filter { $0.time <= end && end - $0.time <= window }
+        guard recent.count >= 3, let last = recent.last, end - last.time < 0.3 else { return nil }
 
         let votes = Dictionary(grouping: recent.compactMap(\.label), by: { $0 })
         guard let (label, hits) = votes.max(by: { $0.value.count < $1.value.count }),
-              Double(hits.count) / Double(recent.count) >= 0.8 else { return nil }
+              Double(hits.count) / Double(recent.count) >= minShare else { return nil }
         let meanConfidence = recent.filter { $0.label == label }.map(\.confidence).reduce(0, +) / Double(hits.count)
-        guard meanConfidence >= minConfidence else { return nil }
+        guard meanConfidence >= (minConfidence ?? self.minConfidence) else { return nil }
         return displays[label]?.id
     }
 
@@ -216,7 +225,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return moved
     }
 
-    private func updateKeyboardInterceptor() {
+    // MARK: - Wink-triggered switching
+
+    /// A wink is an explicit request, so be more lenient about confidence. Use where you were
+    /// looking just *before* the wink, since a shut eye throws the eye features off.
+    private func handleWink(startedAt start: CFAbsoluteTime) {
+        guard FocusSwitcher.isTrusted, calibration == nil,
+              let target = steadyGaze(until: start - 0.02, window: 0.6, minShare: 0.7, minConfidence: 0.5) else {
+            showFlash("🤔")
+            return
+        }
+        showFlash("😉")
+        if FocusSwitcher.focusedDisplay() != target {
+            FocusSwitcher.focus(display: target, warpPointer: warpPointer)
+            lastSwitch = CFAbsoluteTimeGetCurrent()
+        }
+    }
+
+    private func showFlash(_ text: String) {
+        flash = (text, CFAbsoluteTimeGetCurrent() + 0.8)
+        refreshUI()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.85) { [weak self] in self?.refreshUI() }
+    }
+
+    private func applySwitchMode() {
+        // Winks are short; sample faster so they aren't missed between frames.
+        tracker.interval = switchMode == .onWink ? 0.05 : 0.08
         keyboard.burstGap = responsiveness.typingGrace
         if enabled && switchMode == .onTyping && FocusSwitcher.isTrusted {
             keyboard.start()
@@ -313,7 +347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             $0.state = ($0.representedObject as? String) == switchMode.rawValue ? .on : .off
         }
         // Accessibility may have been granted since launch.
-        if enabled && switchMode == .onTyping && !keyboard.isRunning { updateKeyboardInterceptor() }
+        if enabled && switchMode == .onTyping && !keyboard.isRunning { applySwitchMode() }
         refreshUI()
     }
 
@@ -342,7 +376,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Glance")
 
         // Show which screen (numbered left to right) you're looking at.
-        if enabled, let key = lookingAt?.label, let n = screenNumber(for: key) {
+        if let flash, CFAbsoluteTimeGetCurrent() < flash.until {
+            statusItem.button?.title = " \(flash.text)"
+        } else if enabled, let key = lookingAt?.label, let n = screenNumber(for: key) {
             statusItem.button?.title = " \(n)"
         } else {
             statusItem.button?.title = ""
@@ -359,7 +395,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !calibrationMatchesDisplays() { return "Displays changed — please recalibrate" }
             if !faceVisible { return "Can't see you 👀" }
             guard let l = lookingAt, let d = displays[l.label] else { return "Watching…" }
-            return "Looking at \(screenNumber(for: l.label) ?? 0): \(d.screen.localizedName) (\(Int(l.confidence * 100))%)"
+            let eyes = switchMode == .onWink
+                ? "  ·  eyes L \(Int(wink.relative.left * 100))% R \(Int(wink.relative.right * 100))%" : ""
+            return "Looking at \(screenNumber(for: l.label) ?? 0): \(d.screen.localizedName) (\(Int(l.confidence * 100))%)\(eyes)"
         }()
     }
 
@@ -373,7 +411,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func toggleEnabled() {
         enabled.toggle()
         if enabled { startTracking() } else if calibration == nil { tracker.stop() }
-        updateKeyboardInterceptor()
+        applySwitchMode()
         lookingAt = nil
         faceVisible = false
         refreshUI()
@@ -401,7 +439,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let raw = sender.representedObject as? String, let r = Responsiveness(rawValue: raw) {
             responsiveness = r
         }
-        updateKeyboardInterceptor()
+        applySwitchMode()
     }
 
     @objc private func setSwitchMode(_ sender: NSMenuItem) {
@@ -409,7 +447,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             switchMode = m
         }
         candidate = nil
-        updateKeyboardInterceptor()
+        applySwitchMode()
     }
 
     @objc private func selectCamera(_ sender: NSMenuItem) {

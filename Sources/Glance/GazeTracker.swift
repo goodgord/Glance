@@ -5,6 +5,9 @@ import Vision
 struct GazeSample {
     /// [yaw, pitch, noseX, noseY, faceX, faceY, pupilX, pupilY]
     var features: [Double]
+    /// Eye outline height ÷ width for each eye; drops sharply when that eye closes.
+    var leftOpenness: Double = 0
+    var rightOpenness: Double = 0
 }
 
 /// Runs the camera and turns frames into `GazeSample`s using Apple's Vision framework.
@@ -133,7 +136,13 @@ final class GazeTracker: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate 
             Double(noseC.x) - 0.5, Double(noseC.y) - 0.5,
             Double(box.midX), Double(box.midY),
             Double(l.x + r.x) / 2, Double(l.y + r.y) / 2,
-        ])
+        ], leftOpenness: openness(leftEye.normalizedPoints), rightOpenness: openness(rightEye.normalizedPoints))
+    }
+
+    private static func openness(_ eye: [CGPoint]) -> Double {
+        guard let minX = eye.map(\.x).min(), let maxX = eye.map(\.x).max(),
+              let minY = eye.map(\.y).min(), let maxY = eye.map(\.y).max() else { return 0 }
+        return Double((maxY - minY) / max(maxX - minX, 0.0001))
     }
 
     private static func centroid(_ pts: [CGPoint]) -> CGPoint {
